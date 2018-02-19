@@ -135,7 +135,7 @@ def spotify_search(params):
     params={ 'q': params, 'type': 'track' }
     )
     matches=[]
-    if not r.json().get['tracks']:print(r.text)
+    if not r.json().get('tracks'):print(r.text)
     for i in r.json()['tracks']['items']:
         matches.append( {'songid': i['id'],'uri': i['uri'], 'song': i['name'], 'songpop': i['popularity'], 'artist': ','.join([a['name'] for a in i['artists']]), 'artistid': ','.join(
         [a['id'] for a in i['artists']]), 'album': i['album']['name'], 'albumid': i['album']['id']})
