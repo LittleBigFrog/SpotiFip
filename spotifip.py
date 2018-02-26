@@ -5,9 +5,13 @@ import json
 import tweepy
 import boto3
 import os
+import random
+# import pygsheets
+from random import randint
 from boto3.dynamodb.conditions import Key, Attr
 from botocore.exceptions import ClientError
-from datetime import datetime , timedelta
+from datetime import datetime,timedelta,date
+from decimal import Decimal
 
 rules = [['i m ', "i'm "],['i ll ', "i'll "],
          ['c mon ', "c'mon "],
@@ -32,11 +36,11 @@ TWITTER_APP_KEY = os.getenv('TWITTER_APP_KEY')
 TWITTER_APP_SECRET = os.getenv('TWITTER_APP_SECRET')
 playlistname=os.getenv('playlistname')
 playlistmax=int(os.getenv('playlistmax'))
-
+gscripturl=os.getenv('gscripturl')
 
 ##define dynamo table used to store tweets
 dynamodb = boto3.resource('dynamodb', region_name='eu-west-1', endpoint_url="https://dynamodb.eu-west-1.amazonaws.com")
-tweets_table = dynamodb.Table('FipTweets2')
+tweets_table = dynamodb.Table('FipDB')
 
 ##find last tweet stored in db
 def getlastdbtweet():
@@ -53,20 +57,17 @@ def getnewtweets(lastdbtweetid):
     new_tweets=[]
     for status in tweepy.Cursor(api.user_timeline,id='2211149702',since_id=lastdbtweetid,tweet_mode='extended').items(5 if lastdbtweetid==1 else 0):
         if  'nowplaying' in status.full_text and 'Fip Actualite' not in status.full_text:
-	        new_tweets.append({'tweet_id':status.id,'tweet_text':status.full_text,'tweet_time':status.created_at})
+	        new_tweets.append({'id':status.id,'text':status.full_text,'tweet_time':status.created_at,'date':int(status.created_at.date().strftime('%Y%m%d')),'time':int(status.created_at.time().strftime('%H%M%S'))})
     return list(reversed(new_tweets))
 
-##save new tweets in db
-def save_new_tweets(new_tweets):
-    for t in new_tweets:
+def save_new_tweet(t):
         try:
+                t2=t.copy()
+                t2={k:Decimal(str(v)) if isinstance(v, float) else v for k,v in t.items()}
+                for k in ['tweet_time','tweet_song','tweet_album','tweet_artist']:t2.pop(k, None)
+                
                 tweets_table.put_item(
-                    Item={
-                        'id':t['tweet_id'],
-                        'date':int(t['tweet_time'].date().strftime('%Y%m%d')),
-                        'time':int(t['tweet_time'].time().strftime('%H%M%S')),
-                        'text':t['tweet_text'],
-                    },
+                    Item=t2,
                     ConditionExpression='attribute_not_exists(id)'
                     )
         except ClientError as e:
@@ -83,7 +84,7 @@ def cleaner(s):
         return None
 
 def texttosong(tweet):
-    a = str(tweet['tweet_text']).split("nowplaying ")[1].split(' http')[0].strip()
+    a = str(tweet['text']).split("nowplaying ")[1].split(' http')[0].strip()
     if a[-5:-1].isdigit():
         b = [[i, c] for i, c in enumerate(a) if c in ('(', ')')]
         limit = [b[i]
@@ -112,55 +113,60 @@ def texttosong(tweet):
         for i in ['bo/','bof /','bof/']:
           if artist.lower().startswith(i):artist=artist[len(i):]
         artist = artist.split(' - ')[0].split(' (')[0].split('/')[0].strip()
-    tweet['song']=cleaner(song)
-    tweet['artist']=cleaner(artist)
-    tweet['album']=cleaner(album)
+    tweet['tweet_song']=cleaner(song)
+    tweet['tweet_artist']=cleaner(artist)
+    tweet['tweet_album']=cleaner(album)
 
-##get spotify token
+## spotify functions
 def spotifyconnect():
     spotifyurl="https://accounts.spotify.com/api/token"
     spotifydata = {'grant_type': 'refresh_token', 'refresh_token':refresh_token}
-    response = requests.post(spotifyurl, data=spotifydata, auth=(SP_client_id, SP_client_secret))
-    token=response.json()['access_token']
+    r = requests.post(spotifyurl, data=spotifydata, auth=(SP_client_id, SP_client_secret))
+    if r.status_code!=200: print('spotifyconnect error: '+ r.text.rstrip('\n'))
+
+    token=r.json()['access_token']
     headers = {"Authorization":"Bearer "+token}
     return headers
 
-##def spotify functions
-
 def spotify_search(params):
-    global headers
     r=requests.get(
     'https://api.spotify.com/v1/search',
     headers=headers,
     params={ 'q': params, 'type': 'track' }
     )
     matches=[]
-    if not r.json().get('tracks'):print(r.text)
+    if not r.json().get('tracks'):print(r.text.rstrip('\n'))
     for i in r.json()['tracks']['items']:
-        matches.append( {'songid': i['id'],'uri': i['uri'], 'song': i['name'], 'songpop': i['popularity'], 'artist': ','.join([a['name'] for a in i['artists']]), 'artistid': ','.join(
-        [a['id'] for a in i['artists']]), 'album': i['album']['name'], 'albumid': i['album']['id']})
+        m={'songid': i['id'],'uri': i['uri'], 'song': i['name'], 'songpop': i['popularity'], 'artist': ','.join([a['name'] for a in i['artists']]), 'artistid': ','.join([a['id'] for a in i['artists']]), 'album': i['album']['name'], 'albumid': i['album']['id'],'albumdate': i['album']['release_date']}
+        if 'karaoke' not in (m['album']+m['artist']+m['song']).lower():matches.append(m)
     return matches
 
+def scored(tweet,search):
+    for i in search:i['score'] = [fuzz.WRatio(tweet['tweet_song'], i['song']),fuzz.WRatio(tweet['tweet_artist'], i['artist']),fuzz.WRatio(tweet['tweet_album'], i['album']),i['songpop'],len(search)]
+    search = sorted(search, key=lambda i: (i['score'][0],i['score'][1], i['score'][2], i['songpop']),reverse=True)
+    search[0]['score']='/'.join(str(e) for e in search[0]['score'])
+    return search[0]
+
 def spotify_match(tweet):
-    search=spotify_search(f"track:{tweet['song']}" + f" artist:{tweet['artist']}" if tweet['artist'] else '' + f" album:{tweet['album']}" if tweet['album'] else '')
-    if len(search)==1:
-        return search[0]
-    if len(search)>1:
-        for i in search:i['score'] = [fuzz.WRatio(tweet['song'], i['song']),fuzz.WRatio(tweet['artist'], i['artist']),fuzz.WRatio(tweet['album'], i['album']),i['songpop']]
-        search = sorted(search, key=lambda i: (i['score'][0],i['score'][1], i['score'][2], i['songpop']))
-        return search[-1]
-    if tweet['album'] and tweet['artist'] and not search:
-        search=spotify_search(f"track:{tweet['song']}" + f" album:{tweet['album']}" )
-        if len(search)==1:
-            return search[0]
-        if len(search)>1:
-            for i in search:i['score'] = [fuzz.WRatio(tweet['song'], i['song']),fuzz.WRatio(tweet['artist'], i['artist']),fuzz.WRatio(tweet['album'], i['album']),i['songpop']]
-            search = sorted(search, key=lambda i: (i['score'][0],i['score'][1], i['score'][2], i['songpop']))
-            return search[-1]
-    u=str(tweet['tweet_text']).split("nowplaying ")[1].split(' http')[0].strip()
+    search=spotify_search(f"track:{tweet['tweet_song']}" + f" artist:{tweet['tweet_artist']}" if tweet['tweet_artist'] else '' + f" album:{tweet['tweet_album']}" if tweet['tweet_album'] else '')
+    if len(search)>0:
+        return scored(tweet,search)
+    if tweet['tweet_album'] and tweet['tweet_artist'] and not search:
+        search=spotify_search(f"track:{tweet['tweet_song']}" + f" album:{tweet['tweet_album']}" )
+        if len(search)>0:
+            return scored(tweet,search)
+    u=str(tweet['text']).split("nowplaying ")[1].split(' http')[0].strip()
     print(f"unmatched: {u}")
     return{}
 
+def spotify_audiofeatures(tweet):
+    r=requests.get(
+    f"https://api.spotify.com/v1/audio-features/{tweet['songid']}",
+    headers=headers,
+    )
+    r=r.json()
+    [r.pop(k, None) for k in ("type","id",'track_href','uri','analysis_url') ]
+    return r
 
 def get_spotify_playlist(name):
     r=requests.get(
@@ -175,30 +181,73 @@ def get_spotify_playlist(name):
              ,'snapshot_id':p['snapshot_id']}
              for p in ps if p['name']==name][0]
 
-
 def sendtoplaylist(list_uris,playlist):
     payload = {'uris': list_uris}
     url=f"https://api.spotify.com/v1/users/zecharlatan/playlists/{playlist['id']}/tracks"
     r=requests.post(url, headers=headers, data=json.dumps(payload))
     playlist['snapshot_id']=r.json().get('snapshot_id')
-    return r.json()
+    return r.status_code
 
 def removesongsplaylist(n,playlist):
     payload = {'positions': list(range(n)),'snapshot_id':playlist['snapshot_id']}
     url=f"https://api.spotify.com/v1/users/zecharlatan/playlists/{playlist['id']}/tracks"
     r=requests.delete(url, headers=headers, data=json.dumps(payload))
+    return r.status_code
+
+def getatweet():
+    d=int((date(2018, 1, 1)+timedelta(days=randint(0, 50))).strftime('%Y%m%d'))
+    global headers
+    q=tweets_table.query(KeyConditionExpression=Key('date').eq(d))['Items']
+    q2=[i for i in q if not i.get('songid')]
+    if q2:
+        tweet=random.choice(q2)
+        print(tweet)
+        texttosong(tweet)
+        headers=spotifyconnect()
+        tweet = {**tweet, **spotify_match(tweet)}
+        if tweet.get('uri'):
+            tweet = {**tweet, **spotify_audiofeatures(tweet)}
+        else:
+            tweet['songid']=0
+        t2={k:Decimal(str(v)) if isinstance(v, float) else v for k,v in tweet.items()}
+        for k in ['tweet_time','tweet_song','tweet_album','tweet_artist']:t2.pop(k, None)
+        print(t2)
+        tweets_table.put_item(Item=t2)
+
+
+
+
+
+
+
+
+import timeit
+def elapsed(ev=''):
+    if hasattr(elapsed, 'start_time'):
+        tp=(ev+': '+"%.2f" % (timeit.default_timer() - elapsed.start_time))
+        print(tp)
+        elapsed.start_time = timeit.default_timer()
+        return(tp)
+    else:
+        elapsed.start_time = timeit.default_timer()
 
 def lambda_handler(event, context):
     lastdbtweetid=getlastdbtweet()
     new_tweets=getnewtweets(lastdbtweetid)
+    global headers
     if len(new_tweets)>0:
-        save_new_tweets(new_tweets)
         for t in new_tweets: texttosong(t)
-        global headers
         headers=spotifyconnect()
+        uri_list=[]
+        tweetsgdrive=[]
         for tweet in new_tweets:
-            tweet['uri']=spotify_match(tweet).get('uri')
-        uri_list=[t['uri'] for t in new_tweets if t['uri']]
+            tweet = {**tweet, **spotify_match(tweet)}
+            if tweet.get('uri'):
+                tweet = {**tweet, **spotify_audiofeatures(tweet)}
+                uri_list.append(tweet['uri'])
+            else:tweet['songid']=0
+            save_new_tweet(tweet)
+            tweetsgdrive.append(tweet)
 
         if uri_list:
             playlist=get_spotify_playlist(playlistname)
@@ -206,4 +255,11 @@ def lambda_handler(event, context):
             if (playlist['tracks']+len(uri_list))>playlistmax:
                 n=playlist['tracks']+len(uri_list)-playlistmax
                 removesongsplaylist(n,playlist)
-    # print(f'done: {len(new_tweets)} new tweets')
+        elapsed()
+
+        for tweet in tweetsgdrive:
+            l=[i.strftime('%d-%m-%Y %H:%M:%S') if isinstance(i, (datetime)) else i for i in list(tweet.values())]
+            r=requests.get(gscripturl,params={ 'q': l})
+            print('gtime insert: ' + str(elapsed()))
+    else:
+        getatweet()
